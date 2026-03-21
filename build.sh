@@ -5,6 +5,7 @@ g++ -o tools/patch_abl tools/patch_abl.cpp
 mv ./dist/ABL_patched.efi ./dist/ABL.efi  
 xxd -i dist/ABL.efi > edk2/QcomModulePkg/Include/Library/ABL.h
 cd edk2
+source edksetup.sh
 make BOARD_BOOTLOADER_PRODUCT_NAME=canoe TARGET_ARCHITECTURE=AARCH64 TARGET=RELEASE \
   CLANG_BIN=/usr/bin/ CLANG_PREFIX=aarch64-linux-gnu- VERIFIED_BOOT_ENABLED=1 \
   VERIFIED_BOOT_LE=0 AB_RETRYCOUNT_DISABLE=0 TARGET_BOARD_TYPE_AUTO=0 \
@@ -12,8 +13,7 @@ make BOARD_BOOTLOADER_PRODUCT_NAME=canoe TARGET_ARCHITECTURE=AARCH64 TARGET=RELE
   REMOVE_CARVEOUT_REGION=1 QSPA_BOOTCONFIG_ENABLE=1 USER_BUILD_VARIANT=0 \
   PREBUILT_HOST_TOOLS="BUILD_CC=clang BUILD_CXX=clang++ LDPATH=-fuse-ld=lld BUILD_AR=llvm-ar"
 cd ../
-cp edk2/Build/RELEASE_CLANG35/AARCH64/LinuxLoader.efi ./dist/efisp.efi
+cp edk2/Build/RELEASE_CLANG35/AARCH64/LinuxLoader.efi ./dist/ABL_with_superfastboot.efi
 rm ./dist/ABL_original.efi
-rm ./dist/ABL.efi
+mv ./dist/ABL.efi
 cat patch_log.txt
-echo ./dist/ABL.efi is the patched ABL

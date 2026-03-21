@@ -1,8 +1,0 @@
-Patching completed successfully.
-Number of Boot State patches applied: 1
-Number of Lock State patches applied: 1
-Original lock register number W29
-Found LDRB instruction at offset: 0x2528C
-Instruction bytes: 7D 97 53 39
-Instruction bytes: 3D 00 80 52
-Patch applied successfully and saved to ./dist/ABL_patched.efi
