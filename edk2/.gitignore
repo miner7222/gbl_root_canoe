@@ -1,4 +1,6 @@
 Build/
+Conf/
+*.log
 .DS_Store
 *_extdep/
 *.pyc
