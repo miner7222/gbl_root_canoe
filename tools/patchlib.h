@@ -62,27 +62,53 @@ static void locset_print(const LocSet* s) {
     Print_patcher("}\n");
 }
 
-/* 判断一条指令是否为任意形式的 STRB，并提取字段 */
+/* 判断一条指令是否为 STRB 或 32-bit STR W，并提取字段 */
 typedef struct {
     BOOLEAN valid;
     UINT8   rt;
     UINT8   rn;
     UINT32  imm;
-} StrbInfo;
+    UINT8   size;   /* 1 = STRB, 4 = STR W */
+} StoreInfo;
 
-static StrbInfo decode_any_strb(UINT32 raw) {
-    StrbInfo info = { FALSE, 0, 0, 0 };
+/* legacy alias */
+typedef StoreInfo StrbInfo;
+
+static StoreInfo decode_any_store(UINT32 raw) {
+    StoreInfo info = { FALSE, 0, 0, 0, 0 };
     DecodedInst d;
     memset(&d, 0, sizeof(d));
 
     if (decode_inst_strb_imm(raw, &d)) {
-        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = d.imm;
+        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = d.imm; info.size = 1;
     } else if (decode_inst_strb_post(raw, &d)) {
-        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = (UINT32)d.simm & 0x1FF;
+        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = (UINT32)d.simm & 0x1FF; info.size = 1;
     } else if (decode_inst_strb_pre(raw, &d)) {
-        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = (UINT32)d.simm & 0x1FF;
+        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = (UINT32)d.simm & 0x1FF; info.size = 1;
+    } else if (decode_inst_str_w_imm(raw, &d)) {
+        info.valid = TRUE; info.rt = d.rt; info.rn = d.rn; info.imm = d.imm; info.size = 4;
     }
     return info;
+}
+
+/* Fallback (locset empty) sink acceptance check.
+ *
+ * Without bounds, the first store after anchor may land on unrelated
+ * code (loop scratch on stack, lookup table iteration counters, etc.).
+ * Reject obvious non-sinks:
+ *   1. distance: within FALLBACK_MAX_BYTES of anchor
+ *   2. base register: not SP (real sink writes to a context struct field)
+ *   3. offset range: typical device-state field sits at 0x100..0x800
+ */
+#define FALLBACK_MAX_BYTES 0x40
+#define FALLBACK_MIN_FIELD_OFF 0x100
+#define FALLBACK_MAX_FIELD_OFF 0x800
+
+static BOOLEAN fallback_sink_acceptable(StoreInfo si, INT32 off, INT32 anchor_off) {
+    if (off - anchor_off > FALLBACK_MAX_BYTES) return FALSE;
+    if (si.rn == 31) return FALSE;
+    if (si.imm < FALLBACK_MIN_FIELD_OFF || si.imm > FALLBACK_MAX_FIELD_OFF) return FALSE;
+    return TRUE;
 }
 
 INT32 patch_abl_gbl(CHAR8* buffer, INT32 size) {
@@ -187,20 +213,7 @@ static INT32 track_forward_patch_strb(CHAR8* buffer, INT32 size, INT32 ldrb_off,
             }
             break;
 
-        /* ---- STR Wt, [SP, #imm] 32-bit spill ---- */
-        case INST_STR_W_IMM:
-            if (d.rn == 31) {
-                if (locset_has_reg(&set, (INT8)d.rt)) {
-                    Print_patcher("  0x%X: STR W%d,[SP,#0x%X] spill32\n", off, d.rt, d.imm);
-                    locset_add_stk64(&set, d.imm);
-                    locset_print(&set);
-                } else if (locset_has_stk64(&set, d.imm)) {
-                    Print_patcher("  0x%X: STR W%d,[SP,#0x%X] overwrite stk -> del\n", off, d.rt, d.imm);
-                    locset_del_stk64(&set, d.imm);
-                    locset_print(&set);
-                }
-            }
-            break;
+        /* INST_STR_W_IMM SP-spill handling moved into the unified case below. */
 
         /* ---- LDR Wt, [SP, #imm] 32-bit reload ---- */
         case INST_LDR_W_IMM:
@@ -253,43 +266,65 @@ static INT32 track_forward_patch_strb(CHAR8* buffer, INT32 size, INT32 ldrb_off,
             }
             break;
 
-        /* ---- STRB (所有形式) ---- */
+        /* ---- STRB / STR W (所有形式) ----
+         * Boot-state field may be 1 byte (STRB) or 4 bytes (STR W).
+         * Fallback path is gated by fallback_sink_acceptable to avoid
+         * patching unrelated stores after the anchor.
+         */
         case INST_STRB_IMM:
         case INST_STRB_POST:
-        case INST_STRB_PRE: {
-            StrbInfo si = decode_any_strb(d.raw);
-            if (si.valid && (locset_has_reg(&set, (INT8)si.rt)||(locset_empty(&set)&&off > anchor_off))) {
+        case INST_STRB_PRE:
+        case INST_STR_W_IMM: {
+            StoreInfo si = decode_any_store(d.raw);
+            BOOLEAN tracked = si.valid && locset_has_reg(&set, (INT8)si.rt);
+            BOOLEAN fallback = si.valid && locset_empty(&set) && off > anchor_off
+                               && fallback_sink_acceptable(si, off, anchor_off);
+            if (tracked || fallback) {
                 if (off > anchor_off) {
-
                     #ifndef DISABLE_PRINT
+                    const CHAR8* mnem = (si.size == 1) ? "STRB" : "STR ";
                     if (si.rn == 31) {
-                        Print_patcher("  0x%X: STRB W%d,[SP,#0x%X] ** SINK (after anchor0x%X) **\n",
-                        off, si.rt, si.imm, anchor_off);
+                        Print_patcher("  0x%X: %s W%d,[SP,#0x%X] ** SINK (after anchor0x%X)%s **\n",
+                        off, mnem, si.rt, si.imm, anchor_off, fallback ? " [fallback]" : "");
                     } else {
-                        Print_patcher("  0x%X: STRB W%d,[X%d,#0x%X] ** SINK (after anchor0x%X) **\n",
-                        off, si.rt, si.rn, si.imm, anchor_off);
+                        Print_patcher("  0x%X: %s W%d,[X%d,#0x%X] ** SINK (after anchor0x%X)%s **\n",
+                        off, mnem, si.rt, si.rn, si.imm, anchor_off, fallback ? " [fallback]" : "");
                     }
                     #endif
                     Print_patcher("  Before: %02X %02X %02X %02X\n",
                            (UINT8)buffer[off], (UINT8)buffer[off+1],
                            (UINT8)buffer[off+2], (UINT8)buffer[off+3]);
 
+                    /* Rt is bits[0:4] for both STRB and STR W, so the
+                     * STRB rewrite helper applies unchanged. */
                     write_instr(buffer, off, strb_with_reg(d.raw, 31));
 
                     Print_patcher("  After : %02X %02X %02X %02X (Rt -> WZR)\n",
                            (UINT8)buffer[off], (UINT8)buffer[off+1],
                            (UINT8)buffer[off+2], (UINT8)buffer[off+3]);
                     return 1;
-                } else {
+                } else if (si.size == 1) {
                     Print_patcher("  0x%X: STRB W%d,[X%d,#0x%X] before anchor -> spill8\n",
                            off, si.rt, si.rn, si.imm);
                     if (si.rn == 31) locset_add_stk8(&set, si.imm);
                     locset_print(&set);
+                } else if (si.size == 4 && si.rn == 31) {
+                    /* 32-bit spill tracked via stk64 slot (no stk32 category) */
+                    Print_patcher("  0x%X: STR W%d,[SP,#0x%X] before anchor -> spill32\n",
+                           off, si.rt, si.imm);
+                    locset_add_stk64(&set, si.imm);
+                    locset_print(&set);
                 }
-            } else if (si.valid && si.rn == 31 && locset_has_stk8(&set, si.imm)) {
+            } else if (si.valid && si.size == 1 && si.rn == 31
+                       && locset_has_stk8(&set, si.imm)) {
                 Print_patcher("  0x%X: STRB W%d,[SP,#0x%X] overwrite stk8 -> del\n",
                        off, si.rt, si.imm);
                 locset_del_stk8(&set, si.imm);
+            } else if (si.valid && si.size == 4 && si.rn == 31
+                       && locset_has_stk64(&set, si.imm)) {
+                Print_patcher("  0x%X: STR W%d,[SP,#0x%X] overwrite stk -> del\n",
+                       off, si.rt, si.imm);
+                locset_del_stk64(&set, si.imm);
             }
             break;
         }
