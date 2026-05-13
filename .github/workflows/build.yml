@@ -27,16 +27,26 @@ jobs:
         DIST_NAME=toolkit make dist_loader
         make clean
         DIST_NAME=toolkit make dist_loader_windows
-        make clean
-        DIST_NAME=toolkit NDK_PATH=$ANDROID_NDK_LATEST_HOME make dist_loader_android
       
     - name: Build Magisk Module
       run: |
         make clean
         DIST_NAME=magisk_module make build_module
 
-    - name: Upload Artifacts
+    - name: Upload Linux Toolkit
       uses: actions/upload-artifact@v4
       with:
-        name: build-outputs
-        path: release/*.zip
+        name: toolkit_linux
+        path: release/toolkit.zip
+
+    - name: Upload Windows Toolkit
+      uses: actions/upload-artifact@v4
+      with:
+        name: toolkit_windows
+        path: release/toolkit_win_windows.zip
+
+    - name: Upload Magisk Module
+      uses: actions/upload-artifact@v4
+      with:
+        name: magisk_module
+        path: release/magisk_module.zip
