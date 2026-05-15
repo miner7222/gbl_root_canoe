@@ -613,6 +613,154 @@ BOOLEAN patch_string_jump(CHAR8* buffer, INT32 size) {
     return patched;
 }
 
+/* Region-bind compatibility bypass.
+ *
+ * Anchor: diagnostic string printed when image / device region tags
+ * mismatch (typo "is not invalid" intact in known vintages).
+ *
+ * Stage A: Rewrite the cbz Xt sitting one instruction before the
+ * adrp+add to that string into an unconditional B with the same
+ * compatible-path target. The primary mismatch branch can no longer
+ * fall into the shutdown sequence.
+ *
+ * Stage B: Two secondary shutdown branches (B.EQ and CBNZ Xt) in the
+ * same block remain reachable from alternative entries that bypass
+ * the cbz. They both target a single shutdown stub. Overwrite that
+ * stub's first instruction with an unconditional B to the same
+ * compatible-path target so every incoming branch becomes a no-op
+ * redirect.
+ *
+ * 8-byte runtime patch (4 + 4). Stage A alone is enough for the
+ * common direct-mismatch case; Stage B closes the rarer secondary
+ * paths. No-op on images without the anchor.
+ */
+INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
+    static const CHAR8 anchor[] = "region info is not invalid";
+    INT32 anchor_len = (INT32)(sizeof(anchor) - 1);
+
+    /* Locate the anchor string. */
+    INT32 str_off = -1;
+    for (INT32 i = 0; i + anchor_len < size; ++i) {
+        if (memcmp_patcher(buffer + i, anchor, anchor_len) == 0) {
+            str_off = i;
+            break;
+        }
+    }
+    if (str_off < 0) {
+        Print_patcher("region bypass: anchor not found, skipping\n");
+        return 0;
+    }
+    Print_patcher("region bypass: anchor @ 0x%X\n", str_off);
+
+    /* Locate the adrp+add pair that materialises the anchor address. */
+    INT32 adrl_off = -1;
+    for (INT32 i = 0; i + 8 <= size; i += 4) {
+        DecodedInst d0 = decode_at(buffer, i);
+        if (d0.type != INST_ADRP) continue;
+        DecodedInst d1 = decode_at(buffer, i + 4);
+        if (d1.type != INST_ADD_X_IMM) continue;
+        if (d1.rt != d0.rt || d1.rn != d0.rt) continue;
+        INT64 t = calc_adrl_file_offset(buffer, i, 0);
+        if (t == (INT64)str_off) {
+            adrl_off = i;
+            break;
+        }
+    }
+    if (adrl_off < 0) {
+        Print_patcher("region bypass: adrp+add ref not found, skipping\n");
+        return 0;
+    }
+    Print_patcher("region bypass: adrp+add ref @ 0x%X\n", adrl_off);
+
+    /* The gating branch sits exactly one instruction before the adrp. */
+    INT32 cbz_off = adrl_off - 4;
+    if (cbz_off < 0 || cbz_off + 4 > size) {
+        Print_patcher("region bypass: pre-anchor offset out of range\n");
+        return 0;
+    }
+    UINT32 v = *(UINT32*)(buffer + cbz_off);
+
+    /* Accept either CBZ Xt (0xb4) or CBZ Wt (0x34). */
+    UINT8 hi = (UINT8)((v >> 24) & 0xff);
+    if (hi != 0xb4 && hi != 0x34) {
+        Print_patcher("region bypass: pre-anchor instr is 0x%08X (hi=0x%02x),"
+                      " expected CBZ; skipping\n", v, hi);
+        return 0;
+    }
+
+    /* Decode CBZ target. imm19 is signed and scaled by 4. */
+    INT32 imm19 = (INT32)((v >> 5) & 0x7ffff);
+    if (imm19 & 0x40000) imm19 -= 0x80000;
+    INT32 target = cbz_off + imm19 * 4;
+
+    if (target < 0 || target >= size) {
+        Print_patcher("region bypass: cbz target 0x%X out of range\n", target);
+        return 0;
+    }
+    Print_patcher("region bypass: cbz @ 0x%X -> compatible target 0x%X\n",
+                  cbz_off, target);
+
+    /* Stage A: rewrite cbz as unconditional B to the compatible target.
+     * imm26 is signed, scaled by 4, range +/- 128 MB which always
+     * covers a same-function branch. */
+    INT32 imm26 = (target - cbz_off) >> 2;
+    UINT32 new_v = 0x14000000U | ((UINT32)imm26 & 0x3ffffffU);
+
+    Print_patcher("region bypass: patching 0x%08X -> 0x%08X\n", v, new_v);
+    *(UINT32*)(buffer + cbz_off) = new_v;
+
+    /* Stage B: find the secondary shutdown stub and redirect it to the
+     * compatible target. Scan a short window past the primary site for
+     * B.cond / CBZ Xt / CBNZ Xt / CBZ Wt / CBNZ Wt whose target differs
+     * from the compatible target -- those land on the shutdown stub. */
+    INT32 shutdown_tgt = -1;
+    for (INT32 i = cbz_off + 4; i + 4 <= size && i < cbz_off + 0x80; i += 4) {
+        UINT32 ins = read_instr(buffer, i);
+        INT32 t = -1;
+
+        /* B.cond: 0x54xxxxxC where C in [0,15] */
+        if ((ins & 0xFF000010) == 0x54000000) {
+            INT32 b_imm19 = (INT32)((ins >> 5) & 0x7ffff);
+            if (b_imm19 & 0x40000) b_imm19 -= 0x80000;
+            t = i + b_imm19 * 4;
+        } else {
+            UINT8 hi2 = (UINT8)((ins >> 24) & 0xff);
+            if (hi2 == 0x34 || hi2 == 0x35 || hi2 == 0xb4 || hi2 == 0xb5) {
+                INT32 c_imm19 = (INT32)((ins >> 5) & 0x7ffff);
+                if (c_imm19 & 0x40000) c_imm19 -= 0x80000;
+                t = i + c_imm19 * 4;
+            }
+        }
+        if (t < 0 || t >= size) continue;
+        if (t == target) continue; /* compatible-path branch, leave alone */
+
+        shutdown_tgt = t;
+        break;
+    }
+    if (shutdown_tgt < 0) {
+        Print_patcher("region bypass: secondary shutdown stub not seen,"
+                      " stage A only\n");
+        return 1;
+    }
+
+    /* Sanity: stub must be backward (earlier in the section) and within
+     * reach of an unconditional B from itself. */
+    INT32 redirect_imm26 = (target - shutdown_tgt) >> 2;
+    if (redirect_imm26 < -0x2000000 || redirect_imm26 >= 0x2000000) {
+        Print_patcher("region bypass: stub 0x%X out of B range to 0x%X\n",
+                      shutdown_tgt, target);
+        return 1;
+    }
+
+    UINT32 stub_new = 0x14000000U | ((UINT32)redirect_imm26 & 0x3ffffffU);
+    Print_patcher("region bypass: stub @ 0x%X 0x%08X -> 0x%08X (B 0x%X)\n",
+                  shutdown_tgt, read_instr(buffer, shutdown_tgt),
+                  stub_new, target);
+    write_instr(buffer, shutdown_tgt, stub_new);
+
+    return 2;
+}
+
 BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
     #ifndef DISABLE_PATCH_1
     if (patch_abl_gbl(data, size) != 0)
@@ -657,5 +805,11 @@ BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
         Print_patcher("Warning: Failed to patch LDRB->STRB chain for W%d\n",
                (int)lock_register_num);
     }
+
+    #ifndef DISABLE_PATCH_REGION
+    if (patch_region_lockout_bypass(data, size) == 0)
+        Print_patcher("Info: region lockout bypass not applied\n");
+    #endif
+
     return 1;
 }
