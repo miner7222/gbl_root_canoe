@@ -37,6 +37,7 @@ int main(void) {
     const INT32 message = delta + 0x1800;
     CHAR8 complete[0x3000] = {0};
     CHAR8 incomplete[0x3000] = {0};
+    CHAR8 compact[0x3000] = {0};
 
     make_prefixed_pe(complete, delta);
     put_cstr(complete, message,
@@ -67,6 +68,23 @@ int main(void) {
         return 3;
     if (read_instr(incomplete, gate) == NOP)
         return 4;
+
+    make_prefixed_pe(compact, delta);
+    put_cstr(compact, message,
+             "Snapshot Cancel is not allowed in Lock State");
+    const INT32 compact_gate = delta + 0x1900;
+    const INT32 compact_state = delta + 0x1a00;
+    const INT32 compact_xref = compact_state + 8;
+    put32(compact, compact_gate, encode_cbz_w(compact_gate, compact_state, 8));
+    put32(compact, compact_state, 0x94000100);     /* BL */
+    put32(compact, compact_state + 4, 0x54000161); /* B.NE */
+    put32(compact, compact_xref, 0x90000000);      /* ADRP X0 */
+    put32(compact, compact_xref + 4, encode_add_x_imm(0, 0x800));
+
+    if (patch_snapshot_cancel_lock_bypass(compact, sizeof(compact)) != 1)
+        return 5;
+    if (read_instr(compact, compact_gate) != NOP)
+        return 6;
 
     return 0;
 }

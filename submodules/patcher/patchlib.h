@@ -673,19 +673,23 @@ INT32 patch_snapshot_cancel_lock_bypass(CHAR8* buffer, INT32 size) {
         if (xref < 0x10)
             continue;
 
-        INT32 error_block = xref - 0x10;
-        DecodedInst protocol_page = decode_at(buffer, error_block);
-        DecodedInst state_load = decode_at(buffer, error_block + 4);
+        INT32 error_block = -1;
+        DecodedInst protocol_page = decode_at(buffer, xref - 0x10);
+        DecodedInst state_load = decode_at(buffer, xref - 0x0C);
         UINT32 bl = read_instr(buffer, xref - 8);
         UINT32 b_ne = read_instr(buffer, xref - 4);
-        if (protocol_page.type != INST_ADRP || protocol_page.rt != 9)
-            continue;
-        if (state_load.type != INST_LDR_X_IMM
-            || state_load.rt != 8 || state_load.rn != 31)
-            continue;
-        if ((bl & 0xFC000000u) != 0x94000000u)
-            continue;
-        if ((b_ne & 0xFF00001Fu) != 0x54000001u)
+        if (protocol_page.type == INST_ADRP && protocol_page.rt == 9
+            && state_load.type == INST_LDR_X_IMM
+            && state_load.rt == 8 && state_load.rn == 31
+            && (bl & 0xFC000000u) == 0x94000000u
+            && (b_ne & 0xFF00001Fu) == 0x54000001u) {
+            error_block = xref - 0x10;
+        } else if ((bl & 0xFC000000u) == 0x94000000u
+                   && (b_ne & 0xFF00001Fu) == 0x54000001u) {
+            /* Compact error path keeps only the state-check call/branch. */
+            error_block = xref - 8;
+        }
+        if (error_block < 0)
             continue;
 
         INT32 start = xref - 0x300;
@@ -1681,7 +1685,7 @@ static INT32 find_tz_rollback_update_blr(const CHAR8* buffer, INT32 size,
     INT32 found = -1;
     INT32 count = 0;
 
-    for (INT32 off = 0; off <= size - 32; off += 4) {
+    for (INT32 off = 0; off <= size - 36; off += 4) {
         if (read_instr(buffer, off) != mov_id)
             continue;
         if (!is_add_x_sp_imm(read_instr(buffer, off + 4), 3))
@@ -1692,14 +1696,22 @@ static INT32 find_tz_rollback_update_blr(const CHAR8* buffer, INT32 size,
             continue;
         if (read_instr(buffer, off + 16) != 0x2A1F03E2u)
             continue;
-        if (read_instr(buffer, off + 20) != 0xF9401C08u)
+
+        INT32 vtable_load_off = off + 20;
+        DecodedInst context_load = decode_at(buffer, vtable_load_off);
+        if (context_load.type == INST_LDR_X_IMM
+            && context_load.rt == 0 && context_load.rn != 31)
+            vtable_load_off += 4;
+
+        if (read_instr(buffer, vtable_load_off) != 0xF9401C08u)
             continue;
-        if (read_instr(buffer, off + 24) != 0xD63F0100u)
+        INT32 blr_off = vtable_load_off + 4;
+        if (read_instr(buffer, blr_off) != 0xD63F0100u)
             continue;
-        if (!is_cbz_x0(read_instr(buffer, off + 28)))
+        if (!is_cbz_x0(read_instr(buffer, blr_off + 4)))
             continue;
 
-        found = off + 24;
+        found = blr_off;
         count++;
     }
 
